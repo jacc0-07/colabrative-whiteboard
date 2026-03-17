@@ -18,18 +18,37 @@ export default function Whiteboard() {
   const [currentColor, setCurrentColor] = useState(COLORS[0]);
   const [currentBackground, setCurrentBackground] = useState('transparent');
   const [currentSize, setCurrentSize] = useState(SIZES[0]);
+  const [currentFillStyle, setCurrentFillStyle] = useState('hachure');
+  const [currentStrokeStyle, setCurrentStrokeStyle] = useState('solid');
+  const [currentSloppiness, setCurrentSloppiness] = useState(1.8);
+  const [currentOpacity, setCurrentOpacity] = useState(100);
+
+  // Multiplayer State
+  const [liveUsers, setLiveUsers] = useState([]);
+  const [cursors, setCursors] = useState({});
+  const [userName, setUserName] = useState(localStorage.getItem("whiteboard-user") || "");
+  const [showRegModal, setShowRegModal] = useState(!localStorage.getItem("whiteboard-user"));
+  const [tempName, setTempName] = useState("");
 
   // Refs for canvas events so they always access the latest state without re-binding
   const toolRef = useRef(currentTool);
   const colorRef = useRef(currentColor);
   const bgColorRef = useRef(currentBackground);
   const sizeRef = useRef(currentSize);
+  const fillStyleRef = useRef(currentFillStyle);
+  const strokeStyleRef = useRef(currentStrokeStyle);
+  const sloppinessRef = useRef(currentSloppiness);
+  const opacityRef = useRef(currentOpacity);
 
   // Update refs when state changes
   useEffect(() => { toolRef.current = currentTool; }, [currentTool]);
   useEffect(() => { colorRef.current = currentColor; }, [currentColor]);
   useEffect(() => { bgColorRef.current = currentBackground; }, [currentBackground]);
   useEffect(() => { sizeRef.current = currentSize; }, [currentSize]);
+  useEffect(() => { fillStyleRef.current = currentFillStyle; }, [currentFillStyle]);
+  useEffect(() => { strokeStyleRef.current = currentStrokeStyle; }, [currentStrokeStyle]);
+  useEffect(() => { sloppinessRef.current = currentSloppiness; }, [currentSloppiness]);
+  useEffect(() => { opacityRef.current = currentOpacity; }, [currentOpacity]);
 
   let drawing = false;
   let x = 0;
@@ -61,7 +80,20 @@ export default function Whiteboard() {
     window.addEventListener("resize", resizeCanvas);
 
     // Dynamic Draw function that handles all shapes and tools
-    const drawShape = (type, x0, y0, x1, y1, color, bgColor, size, isEraseStroke) => {
+    const drawShape = (type, x0, y0, x1, y1, color, bgColor, size, isEraseStroke, fillStyle = 'hachure', strokeStyle = 'solid', sloppiness = 1.8, opacity = 100, text = '', fontSize = 18) => {
+      // Text is a special case because it doesn't use the same rough.js pipeline.
+      if (type === 'text') {
+        ctx.globalAlpha = opacity / 100;
+        ctx.fillStyle = color;
+        ctx.font = `${fontSize}px sans-serif`;
+        ctx.textBaseline = 'top';
+        ctx.fillText(text || '', x0, y0);
+        ctx.globalAlpha = 1;
+        return;
+      }
+
+      ctx.globalAlpha = isEraseStroke ? 1 : (opacity / 100);
+      
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
       ctx.lineWidth = size;
@@ -72,20 +104,26 @@ export default function Whiteboard() {
       ctx.shadowColor = "transparent";
       
       if (type === 'pen' || type === 'eraser' || !type) {
+        if (!isEraseStroke && strokeStyle === 'dashed') ctx.setLineDash([8, 8]);
+        else if (!isEraseStroke && strokeStyle === 'dotted') ctx.setLineDash([2, 4]);
+        else ctx.setLineDash([]);
+
         ctx.beginPath();
         ctx.moveTo(x0, y0);
         ctx.lineTo(x1, y1);
         ctx.stroke();
+        ctx.setLineDash([]); // reset
       } else {
         const rc = rough.canvas(canvas);
         const options = {
           stroke: isEraseStroke ? BG_COLOR : color,
           strokeWidth: size,
           fill: bgColor !== 'transparent' && !isEraseStroke ? bgColor : undefined,
-          fillStyle: 'hachure',
+          fillStyle: fillStyle,
           fillWeight: size / 2,
-          roughness: 1.8,
+          roughness: sloppiness,
           bowing: 1.2,
+          strokeLineDash: strokeStyle === 'dashed' ? [8, 8] : strokeStyle === 'dotted' ? [2, 4] : undefined,
           // Generate an arbitrary pseudo-seed based on coordinates to stop the shape 
           // from jumping around frantically when dragging or re-rendering it over sockets
           seed: Math.abs(Math.floor(x0 + y0 + x1 + y1)) || 1
@@ -104,8 +142,26 @@ export default function Whiteboard() {
           const distanceY = y1 - y0;
           const diameter = Math.sqrt(distanceX * distanceX + distanceY * distanceY) * 2;
           rc.circle(x0, y0, diameter, options);
+        } else if (type === 'diamond') {
+          const midX = x0 + (x1 - x0) / 2;
+          const midY = y0 + (y1 - y0) / 2;
+          rc.polygon([
+            [midX, y0],
+            [x1, midY],
+            [midX, y1],
+            [x0, midY]
+          ], options);
+        } else if (type === 'arrow') {
+          rc.line(x0, y0, x1, y1, options);
+          const angle = Math.atan2(y1 - y0, x1 - x0);
+          const headLength = 15 + size;
+          const a1 = angle - Math.PI / 6;
+          const a2 = angle + Math.PI / 6;
+          rc.line(x1, y1, x1 - headLength * Math.cos(a1), y1 - headLength * Math.sin(a1), options);
+          rc.line(x1, y1, x1 - headLength * Math.cos(a2), y1 - headLength * Math.sin(a2), options);
         }
       }
+      ctx.globalAlpha = 1; // Always restore for future layers
     };
 
     const getMousePos = (e) => {
@@ -142,9 +198,39 @@ export default function Whiteboard() {
       const color = colorRef.current;
       const bgColor = bgColorRef.current;
       const size = sizeRef.current;
+      const fillStyle = fillStyleRef.current;
+      const strokeStyle = strokeStyleRef.current;
+      const sloppiness = sloppinessRef.current;
+      const opacity = opacityRef.current;
+
+      // Handle text - it's a one-off click interaction rather than a drag
+      if (tool === 'text') {
+        const text = prompt("Enter text to place on the board:");
+        if (text && text.trim()) {
+          const fontSize = 18 + size * 4;
+          drawShape('text', pos.x, pos.y, pos.x, pos.y, color, bgColor, size, false, fillStyle, strokeStyle, sloppiness, opacity, text, fontSize);
+          socket.emit("draw", {
+            type: 'text',
+            x0: pos.x / canvas.width,
+            y0: pos.y / canvas.height,
+            x1: pos.x / canvas.width,
+            y1: pos.y / canvas.height,
+            color: color,
+            bgColor: bgColor,
+            size: size,
+            fillStyle,
+            strokeStyle,
+            sloppiness,
+            opacity,
+            text,
+            fontSize
+          });
+        }
+        return;
+      }
 
       // Ensure the shape completes on screen release and hits the database
-      if (tool !== 'pen' && tool !== 'eraser') {
+      if (tool !== 'pen' && tool !== 'eraser' && tool !== 'select' && tool !== 'image') {
         socket.emit("draw", {
           type: tool,
           x0: startPosRef.current.x / canvas.width,
@@ -153,7 +239,8 @@ export default function Whiteboard() {
           y1: pos.y / canvas.height,
           color: color,
           bgColor: bgColor,
-          size: size
+          size: size,
+          fillStyle, strokeStyle, sloppiness, opacity
         });
       }
     };
@@ -167,9 +254,15 @@ export default function Whiteboard() {
       const color = colorRef.current;
       const bgColor = bgColorRef.current;
       const size = sizeRef.current;
+      const fillStyle = fillStyleRef.current;
+      const strokeStyle = strokeStyleRef.current;
+      const sloppiness = sloppinessRef.current;
+      const opacity = opacityRef.current;
 
-      if (tool === 'pen' || tool === 'eraser') {
-        drawShape(tool, x, y, pos.x, pos.y, color, bgColor, size, tool === 'eraser');
+      if (tool === 'select' || tool === 'text' || tool === 'image') {
+        return; // Work in progress tools
+      } else if (tool === 'pen' || tool === 'eraser') {
+        drawShape(tool, x, y, pos.x, pos.y, color, bgColor, size, tool === 'eraser', fillStyle, strokeStyle, sloppiness, opacity);
         
         // Continuous emit for pens and eraser
         socket.emit("draw", {
@@ -181,7 +274,8 @@ export default function Whiteboard() {
           color: color,
           bgColor: bgColor,
           size: size,
-          isEraser: tool === 'eraser'
+          isEraser: tool === 'eraser',
+          fillStyle, strokeStyle, sloppiness, opacity
         });
 
         x = pos.x;
@@ -191,7 +285,7 @@ export default function Whiteboard() {
         if (snapshotRef.current) {
           ctx.putImageData(snapshotRef.current, 0, 0);
         }
-        drawShape(tool, startPosRef.current.x, startPosRef.current.y, pos.x, pos.y, color, bgColor, size, false);
+        drawShape(tool, startPosRef.current.x, startPosRef.current.y, pos.x, pos.y, color, bgColor, size, false, fillStyle, strokeStyle, sloppiness, opacity);
       }
     };
 
@@ -199,6 +293,13 @@ export default function Whiteboard() {
     canvas.addEventListener("mousedown", startDrawing);
     window.addEventListener("mouseup", stopDrawing);
     canvas.addEventListener("mousemove", draw);
+
+    // Track plain mouse movement for Live Cursors
+    const trackCursor = (e) => {
+      const pos = getMousePos(e);
+      socket.emit("cursorMove", { x: pos.x / canvas.width, y: pos.y / canvas.height });
+    };
+    canvas.addEventListener("mousemove", trackCursor);
 
     canvas.addEventListener("touchstart", startDrawing, { passive: false });
     window.addEventListener("touchend", stopDrawing, { passive: false });
@@ -219,7 +320,8 @@ export default function Whiteboard() {
           s.color,
           s.bgColor || 'transparent',
           s.size,
-          isErase
+          isErase,
+          s.fillStyle, s.strokeStyle, s.sloppiness, s.opacity
         );
       });
     });
@@ -235,7 +337,8 @@ export default function Whiteboard() {
         data.color,
         data.bgColor || 'transparent',
         data.size,
-        isErase
+        isErase,
+        data.fillStyle, data.strokeStyle, data.sloppiness, data.opacity
       );
     });
 
@@ -258,11 +361,12 @@ export default function Whiteboard() {
           s.color,
           s.bgColor || 'transparent',
           s.size,
-          isErase
+          isErase,
+          s.fillStyle, s.strokeStyle, s.sloppiness, s.opacity
         );
         
         i++;
-        setTimeout(replay,300 );
+        setTimeout(replay, 300);
       }
       replay();
     });
@@ -272,6 +376,31 @@ export default function Whiteboard() {
       ctx.fillRect(0, 0, canvas.width, canvas.height);
     });
 
+    // Handle Live Cursors
+    socket.on("usersUpdate", (users) => {
+      setLiveUsers(users);
+    });
+
+    socket.on("cursorMove", (user) => {
+      setCursors((prev) => ({
+        ...prev,
+        [user.id]: user
+      }));
+    });
+
+    socket.on("userLeft", (userId) => {
+      setCursors((prev) => {
+        const newCursors = { ...prev };
+        delete newCursors[userId];
+        return newCursors;
+      });
+    });
+
+    // If user has a name, sync it immediately
+    if (userName) {
+      socket.emit("updateUser", { name: userName });
+    }
+
     return () => {
       window.removeEventListener("resize", resizeCanvas);
       canvas.removeEventListener("mousedown", startDrawing);
@@ -280,11 +409,15 @@ export default function Whiteboard() {
       canvas.removeEventListener("touchstart", startDrawing);
       window.removeEventListener("touchend", stopDrawing);
       canvas.removeEventListener("touchmove", draw);
+      canvas.removeEventListener("mousemove", trackCursor);
       
       socket.off("draw");
       socket.off("initData");
       socket.off("replayData");
       socket.off("clearBoard");
+      socket.off("usersUpdate");
+      socket.off("cursorMove");
+      socket.off("userLeft");
     };
   }, []);
 
@@ -306,10 +439,61 @@ export default function Whiteboard() {
     link.click();
   };
 
+  const handleRegister = (e) => {
+    e.preventDefault();
+    if (!tempName.trim()) return;
+    setUserName(tempName);
+    localStorage.setItem("whiteboard-user", tempName);
+    setShowRegModal(false);
+    socket.emit("updateUser", { name: tempName });
+  };
+
   return (
     <>
+      {/* Registration Modal */}
+      {showRegModal && (
+        <div className="modal-overlay">
+          <div className="modal-content">
+            <h2 className="modal-title">Welcome to Whiteboard</h2>
+            <p className="modal-subtitle">Enter your name to start collaborating</p>
+            <form onSubmit={handleRegister}>
+              <input 
+                type="text" 
+                className="modal-input" 
+                placeholder="Your Name (e.g. John Doe)" 
+                value={tempName}
+                onChange={(e) => setTempName(e.target.value)}
+                autoFocus
+                required
+              />
+              <button type="submit" className="modal-submit-btn">
+                Enter Whiteboard
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
       <div className="whiteboard-wrapper">
         <canvas ref={canvasRef}></canvas>
+        
+        {/* Render Live Multiplayer Cursors */}
+        {Object.values(cursors).map(cursor => (
+          <div 
+            key={cursor.id} 
+            className="cursor-wrapper"
+            style={{
+              transform: `translate(${cursor.x * window.innerWidth}px, ${cursor.y * window.innerHeight}px)`
+            }}
+          >
+            <svg viewBox="0 0 16 16" fill={cursor.color} width="24" height="24">
+              <path stroke="#ffffff" strokeWidth="2" strokeLinejoin="round" d="M3 2l10 10.6-4.6.4 3 4.2-2.2 1.4-3-4.2-3.4 3.2z"></path>
+            </svg>
+            <div className="cursor-nametag" style={{ backgroundColor: cursor.color }}>
+              {cursor.name}
+            </div>
+          </div>
+        ))}
       </div>
 
       {/* Top Left Menu */}
@@ -367,7 +551,21 @@ export default function Whiteboard() {
         </button>
       </div>
 
-
+      {/* Top Right Live Users Widget */}
+      {liveUsers.length > 1 && (
+        <div className="top-right-actions">
+          <div className="avatars">
+            {liveUsers.slice(0, 4).map((u) => (
+              <div key={u.id} className="avatar" style={{ backgroundColor: u.color, color: 'white', border: '2px solid white' }} title={u.name}>
+                {u.initials}
+              </div>
+            ))}
+            {liveUsers.length > 4 && (
+              <div className="avatar">+{liveUsers.length - 4}</div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Custom Data Actions (Bottom Right) */}
       <div className="bottom-right-actions flex-col">
@@ -452,9 +650,9 @@ export default function Whiteboard() {
         <div className="prop-section">
            <div className="panel-title">Fill</div>
            <div className="button-group">
-              <button className="icon-btn-radio active"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M3 3l18 18M3 9l18 18M3 15l18 18M9 3l18 18M15 3l18 18"/></svg></button>
-              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="12" cy="12" r="3" fill="currentColor"/></svg></button>
-              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="3" width="18" height="18" rx="2"></rect></svg></button>
+              <button className={`icon-btn-radio ${currentFillStyle === 'hachure' ? 'active' : ''}`} onClick={() => setCurrentFillStyle('hachure')}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M3 3l18 18M3 9l18 18M3 15l18 18M9 3l18 18M15 3l18 18"/></svg></button>
+              <button className={`icon-btn-radio ${currentFillStyle === 'cross-hatch' ? 'active' : ''}`} onClick={() => setCurrentFillStyle('cross-hatch')}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="12" cy="12" r="3" fill="currentColor"/></svg></button>
+              <button className={`icon-btn-radio ${currentFillStyle === 'solid' ? 'active' : ''}`} onClick={() => setCurrentFillStyle('solid')}><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="3" width="18" height="18" rx="2"></rect></svg></button>
            </div>
         </div>
 
@@ -476,18 +674,18 @@ export default function Whiteboard() {
         <div className="prop-section">
            <div className="panel-title">Stroke style</div>
            <div className="button-group">
-              <button className="icon-btn-radio active"><div style={{width:'12px', height:'2px', background:'currentColor'}}/></button>
-              <button className="icon-btn-radio"><div style={{width:'12px', height:'2px', borderTop:'2px dashed currentColor'}}/></button>
-              <button className="icon-btn-radio"><div style={{width:'12px', height:'2px', borderTop:'2px dotted currentColor'}}/></button>
+              <button className={`icon-btn-radio ${currentStrokeStyle === 'solid' ? 'active' : ''}`} onClick={() => setCurrentStrokeStyle('solid')}><div style={{width:'12px', height:'2px', background:'currentColor'}}/></button>
+              <button className={`icon-btn-radio ${currentStrokeStyle === 'dashed' ? 'active' : ''}`} onClick={() => setCurrentStrokeStyle('dashed')}><div style={{width:'12px', height:'2px', borderTop:'2px dashed currentColor'}}/></button>
+              <button className={`icon-btn-radio ${currentStrokeStyle === 'dotted' ? 'active' : ''}`} onClick={() => setCurrentStrokeStyle('dotted')}><div style={{width:'12px', height:'2px', borderTop:'2px dotted currentColor'}}/></button>
            </div>
         </div>
 
         <div className="prop-section">
            <div className="panel-title">Sloppiness</div>
            <div className="button-group">
-              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 12h18"/></svg></button>
-              <button className="icon-btn-radio active"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 14c4-4 6-4 10 0s6 4 10 0"/></svg></button>
-              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 16c2-8 3-8 6 0 2 6 3 6 6 0 2-4 3-4 6 0"/></svg></button>
+              <button className={`icon-btn-radio ${currentSloppiness === 0 ? 'active' : ''}`} onClick={() => setCurrentSloppiness(0)}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 12h18"/></svg></button>
+              <button className={`icon-btn-radio ${currentSloppiness === 1.8 ? 'active' : ''}`} onClick={() => setCurrentSloppiness(1.8)}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 14c4-4 6-4 10 0s6 4 10 0"/></svg></button>
+              <button className={`icon-btn-radio ${currentSloppiness === 3 ? 'active' : ''}`} onClick={() => setCurrentSloppiness(3)}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 16c2-8 3-8 6 0 2 6 3 6 6 0 2-4 3-4 6 0"/></svg></button>
            </div>
         </div>
 
@@ -501,7 +699,7 @@ export default function Whiteboard() {
 
         <div className="prop-section">
            <div className="panel-title">Opacity</div>
-           <input type="range" min="10" max="100" defaultValue="100" className="opacity-slider" />
+           <input type="range" min="10" max="100" value={currentOpacity} onChange={(e) => setCurrentOpacity(Number(e.target.value))} className="opacity-slider" />
         </div>
 
         <div className="prop-section border-top">
