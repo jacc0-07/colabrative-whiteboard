@@ -366,7 +366,7 @@ export default function Whiteboard() {
         );
         
         i++;
-        setTimeout(replay, 300);
+        setTimeout(replay, 800);
       }
       replay();
     });
