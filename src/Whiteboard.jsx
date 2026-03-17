@@ -262,7 +262,7 @@ export default function Whiteboard() {
         );
         
         i++;
-        setTimeout(replay, 10);
+        setTimeout(replay,200 );
       }
       replay();
     });
