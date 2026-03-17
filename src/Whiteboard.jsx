@@ -1,0 +1,516 @@
+import { useEffect, useRef, useState } from "react";
+import { io } from "socket.io-client";
+import rough from "roughjs";
+
+const socket = io("http://localhost:5000");
+
+const COLORS = ["#1e1e1e", "#e03131", "#2f9e44", "#1971c2", "#f08c00", "#a5d8ff"];
+const SIZES = [2, 4, 8];
+const BG_COLOR = "#f8f9fa";
+
+export default function Whiteboard() {
+  const canvasRef = useRef(null);
+  const snapshotRef = useRef(null);
+  const startPosRef = useRef({x: 0, y: 0});
+  
+  // React State for UI
+  const [currentTool, setCurrentTool] = useState('pen');
+  const [currentColor, setCurrentColor] = useState(COLORS[0]);
+  const [currentBackground, setCurrentBackground] = useState('transparent');
+  const [currentSize, setCurrentSize] = useState(SIZES[0]);
+
+  // Refs for canvas events so they always access the latest state without re-binding
+  const toolRef = useRef(currentTool);
+  const colorRef = useRef(currentColor);
+  const bgColorRef = useRef(currentBackground);
+  const sizeRef = useRef(currentSize);
+
+  // Update refs when state changes
+  useEffect(() => { toolRef.current = currentTool; }, [currentTool]);
+  useEffect(() => { colorRef.current = currentColor; }, [currentColor]);
+  useEffect(() => { bgColorRef.current = currentBackground; }, [currentBackground]);
+  useEffect(() => { sizeRef.current = currentSize; }, [currentSize]);
+
+  let drawing = false;
+  let x = 0;
+  let y = 0;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    
+    // Resize observer to keep canvas sharp
+    const resizeCanvas = () => {
+      const parent = canvas.parentElement;
+      // Save content before resize
+      const imgData = canvas.width > 0 ? ctx.getImageData(0, 0, canvas.width, canvas.height) : null;
+      
+      canvas.width = parent.clientWidth;
+      canvas.height = parent.clientHeight;
+      
+      // Fill background
+      ctx.fillStyle = BG_COLOR;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      
+      if (imgData) {
+        ctx.putImageData(imgData, 0, 0);
+      }
+    };
+    
+    resizeCanvas();
+    window.addEventListener("resize", resizeCanvas);
+
+    // Dynamic Draw function that handles all shapes and tools
+    const drawShape = (type, x0, y0, x1, y1, color, bgColor, size, isEraseStroke) => {
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.lineWidth = size;
+      ctx.strokeStyle = isEraseStroke ? BG_COLOR : color;
+      
+      // Remove neon shadow for the crisp Excalidraw look
+      ctx.shadowBlur = 0;
+      ctx.shadowColor = "transparent";
+      
+      if (type === 'pen' || type === 'eraser' || !type) {
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+      } else {
+        const rc = rough.canvas(canvas);
+        const options = {
+          stroke: isEraseStroke ? BG_COLOR : color,
+          strokeWidth: size,
+          fill: bgColor !== 'transparent' && !isEraseStroke ? bgColor : undefined,
+          fillStyle: 'hachure',
+          fillWeight: size / 2,
+          roughness: 1.8,
+          bowing: 1.2,
+          // Generate an arbitrary pseudo-seed based on coordinates to stop the shape 
+          // from jumping around frantically when dragging or re-rendering it over sockets
+          seed: Math.abs(Math.floor(x0 + y0 + x1 + y1)) || 1
+        };
+
+        if (type === 'line') {
+          rc.line(x0, y0, x1, y1, options);
+        } else if (type === 'rect') {
+          const width = x1 - x0;
+          const height = y1 - y0;
+          rc.rectangle(x0, y0, width, height, options);
+        } else if (type === 'circle') {
+          // roughjs circle: centerX, centerY, diameter
+          // If you start dragging from x0,y0, then x0,y0 is the center!
+          const distanceX = x1 - x0;
+          const distanceY = y1 - y0;
+          const diameter = Math.sqrt(distanceX * distanceX + distanceY * distanceY) * 2;
+          rc.circle(x0, y0, diameter, options);
+        }
+      }
+    };
+
+    const getMousePos = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+      return {
+        x: clientX - rect.left,
+        y: clientY - rect.top
+      };
+    };
+
+    const startDrawing = (e) => {
+      if (e.target !== canvas) return;
+      drawing = true;
+      const pos = getMousePos(e);
+      x = pos.x;
+      y = pos.y;
+      startPosRef.current = { x: pos.x, y: pos.y };
+
+      const tool = toolRef.current;
+      // If we are drawing a shape, take a snapshot of the canvas so we can preview the outline cleanly
+      if (tool !== 'pen' && tool !== 'eraser') {
+        snapshotRef.current = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      }
+    };
+
+    const stopDrawing = (e) => {
+      if (!drawing) return;
+      drawing = false;
+
+      const pos = getMousePos(e);
+      const tool = toolRef.current;
+      const color = colorRef.current;
+      const bgColor = bgColorRef.current;
+      const size = sizeRef.current;
+
+      // Ensure the shape completes on screen release and hits the database
+      if (tool !== 'pen' && tool !== 'eraser') {
+        socket.emit("draw", {
+          type: tool,
+          x0: startPosRef.current.x / canvas.width,
+          y0: startPosRef.current.y / canvas.height,
+          x1: pos.x / canvas.width,
+          y1: pos.y / canvas.height,
+          color: color,
+          bgColor: bgColor,
+          size: size
+        });
+      }
+    };
+
+    const draw = (e) => {
+      if (!drawing) return;
+      e.preventDefault();
+      
+      const pos = getMousePos(e);
+      const tool = toolRef.current;
+      const color = colorRef.current;
+      const bgColor = bgColorRef.current;
+      const size = sizeRef.current;
+
+      if (tool === 'pen' || tool === 'eraser') {
+        drawShape(tool, x, y, pos.x, pos.y, color, bgColor, size, tool === 'eraser');
+        
+        // Continuous emit for pens and eraser
+        socket.emit("draw", {
+          type: tool,
+          x0: x / canvas.width,
+          y0: y / canvas.height,
+          x1: pos.x / canvas.width,
+          y1: pos.y / canvas.height,
+          color: color,
+          bgColor: bgColor,
+          size: size,
+          isEraser: tool === 'eraser'
+        });
+
+        x = pos.x;
+        y = pos.y;
+      } else {
+        // We are drawing a shape interactively. Restore the clean snapshot, then draw the preview over it
+        if (snapshotRef.current) {
+          ctx.putImageData(snapshotRef.current, 0, 0);
+        }
+        drawShape(tool, startPosRef.current.x, startPosRef.current.y, pos.x, pos.y, color, bgColor, size, false);
+      }
+    };
+
+    // Events
+    canvas.addEventListener("mousedown", startDrawing);
+    window.addEventListener("mouseup", stopDrawing);
+    canvas.addEventListener("mousemove", draw);
+
+    canvas.addEventListener("touchstart", startDrawing, { passive: false });
+    window.addEventListener("touchend", stopDrawing, { passive: false });
+    canvas.addEventListener("touchmove", draw, { passive: false });
+
+    // Socket Handlers
+    socket.on("initData", (strokes) => {
+      ctx.fillStyle = BG_COLOR;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      strokes.forEach(s => {
+        const isErase = s.type === 'eraser' || s.isEraser;
+        drawShape(
+          s.type || 'pen',
+          s.x0 * canvas.width, 
+          s.y0 * canvas.height, 
+          s.x1 * canvas.width, 
+          s.y1 * canvas.height,
+          s.color,
+          s.bgColor || 'transparent',
+          s.size,
+          isErase
+        );
+      });
+    });
+
+    socket.on("draw", (data) => {
+      const isErase = data.type === 'eraser' || data.isEraser;
+      drawShape(
+        data.type || 'pen',
+        data.x0 * canvas.width, 
+        data.y0 * canvas.height, 
+        data.x1 * canvas.width, 
+        data.y1 * canvas.height,
+        data.color,
+        data.bgColor || 'transparent',
+        data.size,
+        isErase
+      );
+    });
+
+    socket.on("replayData", (strokes) => {
+      ctx.fillStyle = BG_COLOR;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      let i = 0;
+
+      function replay() {
+        if (i >= strokes.length) return;
+        const s = strokes[i];
+        
+        const isErase = s.type === 'eraser' || s.isEraser;
+        drawShape(
+          s.type || 'pen',
+          s.x0 * canvas.width, 
+          s.y0 * canvas.height, 
+          s.x1 * canvas.width, 
+          s.y1 * canvas.height,
+          s.color,
+          s.bgColor || 'transparent',
+          s.size,
+          isErase
+        );
+        
+        i++;
+        setTimeout(replay, 10);
+      }
+      replay();
+    });
+
+    socket.on("clearBoard", () => {
+      ctx.fillStyle = BG_COLOR;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    });
+
+    return () => {
+      window.removeEventListener("resize", resizeCanvas);
+      canvas.removeEventListener("mousedown", startDrawing);
+      window.removeEventListener("mouseup", stopDrawing);
+      canvas.removeEventListener("mousemove", draw);
+      canvas.removeEventListener("touchstart", startDrawing);
+      window.removeEventListener("touchend", stopDrawing);
+      canvas.removeEventListener("touchmove", draw);
+      
+      socket.off("draw");
+      socket.off("initData");
+      socket.off("replayData");
+      socket.off("clearBoard");
+    };
+  }, []);
+
+  const replay = () => { socket.emit("getReplay"); };
+  
+  const clearBoard = () => {
+    socket.emit("clearBoard");
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = BG_COLOR;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  };
+
+  const saveImage = () => {
+    const canvas = canvasRef.current;
+    const link = document.createElement("a");
+    link.download = "whiteboard.png";
+    link.href = canvas.toDataURL();
+    link.click();
+  };
+
+  return (
+    <>
+      <div className="whiteboard-wrapper">
+        <canvas ref={canvasRef}></canvas>
+      </div>
+
+      {/* Top Left Menu */}
+      <div className="top-left-menu">
+        <button className="icon-btn-square">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+        </button>
+      </div>
+
+      {/* Top Center Tools Panel */}
+      <div className="toolbar center-toolbar">
+        <button className="icon-btn lock-btn" title="Keep tool selected">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+        </button>
+        <div className="tool-divider"></div>
+
+        <button className={`action-btn ${currentTool === 'select' ? 'active' : ''}`} onClick={() => setCurrentTool('select')} title="Selection">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"></path><path d="M13 13l6 6"></path></svg>
+        </button>
+
+        <button className={`action-btn ${currentTool === 'rect' ? 'active' : ''}`} onClick={() => setCurrentTool('rect')} title="Rectangle">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" /></svg>
+        </button>
+
+        <button className={`action-btn ${currentTool === 'diamond' ? 'active' : ''}`} onClick={() => setCurrentTool('diamond')} title="Diamond">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 22 12 12 22 2 12"></polygon></svg>
+        </button>
+
+        <button className={`action-btn ${currentTool === 'circle' ? 'active' : ''}`} onClick={() => setCurrentTool('circle')} title="Ellipse">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /></svg>
+        </button>
+
+        <button className={`action-btn ${currentTool === 'arrow' ? 'active' : ''}`} onClick={() => setCurrentTool('arrow')} title="Arrow">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
+        </button>
+
+        <button className={`action-btn ${currentTool === 'line' ? 'active' : ''}`} onClick={() => setCurrentTool('line')} title="Line">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="19" x2="19" y2="5" /></svg>
+        </button>
+
+        <button className={`action-btn ${currentTool === 'pen' ? 'active' : ''}`} onClick={() => setCurrentTool('pen')} title="Pen">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+        </button>
+        
+        <button className={`action-btn ${currentTool === 'text' ? 'active' : ''}`} onClick={() => setCurrentTool('text')} title="Text">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="4 7 4 4 20 4 20 7"></polyline><line x1="9" y1="20" x2="15" y2="20"></line><line x1="12" y1="4" x2="12" y2="20"></line></svg>
+        </button>
+
+        <button className={`action-btn ${currentTool === 'image' ? 'active' : ''}`} onClick={() => setCurrentTool('image')} title="Insert image">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+        </button>
+
+        <button className={`action-btn ${currentTool === 'eraser' ? 'active' : ''}`} onClick={() => setCurrentTool('eraser')} title="Eraser">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"></path><path d="M22 21H7"></path><path d="m5 11 9 9"></path></svg>
+        </button>
+      </div>
+
+
+
+      {/* Custom Data Actions (Bottom Right) */}
+      <div className="bottom-right-actions flex-col">
+           <button className="icon-btn-square" onClick={saveImage} title="Save to PNG">
+             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
+           </button>
+           <button className="icon-btn-square" onClick={replay} title="Replay">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="1 4 1 10 7 10"></polyline>
+              <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
+            </svg>
+           </button>
+           <button className="icon-btn-square" onClick={clearBoard} title="Clear Board" style={{color: '#fa5252'}}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+           </button>
+      </div>
+
+      {/* Bottom Left Zoom / History Actions */}
+      <div className="bottom-left-actions">
+        <button className="icon-btn-square">-</button>
+        <span className="zoom-level">63%</span>
+        <button className="icon-btn-square">+</button>
+        <div className="tool-divider"></div>
+        <button className="icon-btn-square">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7v6h6"></path><path d="M21 17a9 9 0 00-9-9 9 9 0 00-6 2.3L3 13"></path></svg>
+        </button>
+        <button className="icon-btn-square">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 7v6h-6"></path><path d="M3 17a9 9 0 019-9 9 9 0 016 2.3l3 2.7"></path></svg>
+        </button>
+      </div>
+
+      { /* Left Side Properties Panel - Designed exactly to match the image */ }
+      <div className="properties-panel" style={{ opacity: currentTool === 'eraser' ? 0.3 : 1, pointerEvents: currentTool === 'eraser' ? 'none' : 'auto' }}>
+        
+        <div className="prop-section">
+          <div className="panel-title">Stroke</div>
+          <div className="hex-display">
+            <div className="color-swatch" style={{backgroundColor: currentColor}}></div>
+            <span>{currentColor}</span>
+          </div>
+          <div className="color-grid">
+            {COLORS.map(c => (
+               <button 
+                 key={c}
+                 className={`color-btn ${currentColor === c ? 'active' : ''}`}
+                 style={{ backgroundColor: c }}
+                 onClick={() => setCurrentColor(c)}
+               />
+            ))}
+          </div>
+        </div>
+
+        { /* Show Fill properties only for shapes that can be filled */ }
+        {(currentTool === 'rect' || currentTool === 'circle' || currentTool === 'diamond') && (
+          <div className="prop-section">
+            <div className="panel-title">Background</div>
+            <div className="hex-display">
+              <div className="color-swatch empty" style={currentBackground !== 'transparent' ? {backgroundColor: currentBackground} : {}}></div>
+              <span>{currentBackground === 'transparent' ? 'transparent' : currentBackground}</span>
+            </div>
+            <div className="color-grid">
+              <button 
+                 className={`color-btn custom-transparent ${currentBackground === 'transparent' ? 'active' : ''}`}
+                 onClick={() => setCurrentBackground('transparent')}
+                 title="Transparent"
+              >
+                <div className="strike"></div>
+              </button>
+              {COLORS.filter((_, i) => i > 0).map(c => (
+                 <button 
+                   key={c}
+                   className={`color-btn ${currentBackground === c ? 'active' : ''}`}
+                   style={{ backgroundColor: c }}
+                   onClick={() => setCurrentBackground(c)}
+                 />
+              ))}
+            </div>
+          </div>
+        )}
+
+        { /* Mock controls to match the exact aesthetic */ }
+        <div className="prop-section">
+           <div className="panel-title">Fill</div>
+           <div className="button-group">
+              <button className="icon-btn-radio active"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M3 3l18 18M3 9l18 18M3 15l18 18M9 3l18 18M15 3l18 18"/></svg></button>
+              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="12" cy="12" r="3" fill="currentColor"/></svg></button>
+              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="3" width="18" height="18" rx="2"></rect></svg></button>
+           </div>
+        </div>
+
+        <div className="prop-section">
+          <div className="panel-title">Stroke width</div>
+          <div className="button-group">
+             {SIZES.map((s, idx) => (
+               <button 
+                 key={s}
+                 className={`icon-btn-radio ${currentSize === s ? 'active' : ''}`}
+                 onClick={() => setCurrentSize(s)}
+               >
+                  <div style={{ width: '12px', height: `${1 + idx*2}px`, background: 'currentColor', borderRadius: '1px'}}></div>
+               </button>
+             ))}
+          </div>
+        </div>
+
+        <div className="prop-section">
+           <div className="panel-title">Stroke style</div>
+           <div className="button-group">
+              <button className="icon-btn-radio active"><div style={{width:'12px', height:'2px', background:'currentColor'}}/></button>
+              <button className="icon-btn-radio"><div style={{width:'12px', height:'2px', borderTop:'2px dashed currentColor'}}/></button>
+              <button className="icon-btn-radio"><div style={{width:'12px', height:'2px', borderTop:'2px dotted currentColor'}}/></button>
+           </div>
+        </div>
+
+        <div className="prop-section">
+           <div className="panel-title">Sloppiness</div>
+           <div className="button-group">
+              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 12h18"/></svg></button>
+              <button className="icon-btn-radio active"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 14c4-4 6-4 10 0s6 4 10 0"/></svg></button>
+              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 16c2-8 3-8 6 0 2 6 3 6 6 0 2-4 3-4 6 0"/></svg></button>
+           </div>
+        </div>
+
+        <div className="prop-section">
+           <div className="panel-title">Edges</div>
+           <div className="button-group" style={{width: '66%'}}>
+              <button className="icon-btn-radio active"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="4" y="4" width="16" height="16"/></svg></button>
+              <button className="icon-btn-radio"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="4" y="4" width="16" height="16" rx="4"/></svg></button>
+           </div>
+        </div>
+
+        <div className="prop-section">
+           <div className="panel-title">Opacity</div>
+           <input type="range" min="10" max="100" defaultValue="100" className="opacity-slider" />
+        </div>
+
+        <div className="prop-section border-top">
+           <div className="panel-title">Layers</div>
+           <div className="button-group">
+              <button className="text-btn">Send backward</button>
+           </div>
+        </div>
+      </div>
+    </>
+  );
+}
