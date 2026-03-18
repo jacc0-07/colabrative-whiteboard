@@ -106,7 +106,7 @@ export default function Whiteboard() {
       }
 
       if (type === 'text') {
-        ctx.font = `${size * 4 || 20}px 'Inter', sans-serif`;
+        ctx.font = `${size * 16 || 64}px 'Inter', sans-serif`;
         ctx.fillStyle = color;
         ctx.fillText(text, x0, y0);
         ctx.globalAlpha = 1;
